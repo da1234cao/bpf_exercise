@@ -142,11 +142,13 @@ BPF程序逻辑非常简单。为样本获取一个临时存储，并用跟踪�
 
 ---
 
-## BPF skeleton and BPF app lifecycle
+## libbpf-bootstrap
+
+### BPF skeleton and BPF app lifecycle
 
 在开始看用户空间代码之前，我们需要先了解[BPF skeleton](https://nakryiko.com/posts/bcc-to-libbpf-howto-guide/#bpf-skeleton-and-bpf-app-lifecycle)。
 
-使用 BPF 框架（以及一般的 libbpf API）的详细解释超出了本文档的范围，现有的[内核自测](https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/tree/tools/testing/selftests/bpf)和 BCC [libbpf-tools 示例](https://github.com/iovisor/bcc/tree/master/libbpf-tools)可能是学习的最佳方式。查看 [runqslower](https://github.com/iovisor/bcc/blob/master/libbpf-tools/runqslower.c) 示例也可作为一个使用 skeleton 的简单但真实的工具。
+使用 BPF skeleton（以及一般的 libbpf API）的详细解释超出了本文档的范围，现有的[内核自测](https://git.kernel.org/pub/scm/linux/kernel/git/bpf/bpf-next.git/tree/tools/testing/selftests/bpf)和 BCC [libbpf-tools 示例](https://github.com/iovisor/bcc/tree/master/libbpf-tools)可能是学习的最佳方式。查看 [runqslower](https://github.com/iovisor/bcc/blob/master/libbpf-tools/runqslower.c) 示例也可作为一个使用 skeleton 的简单但真实的工具。
 
 尽管如此，解释每个 BPF 应用程序所涉及的 libbpf 概念和对应的阶段还是很有用的。BPF 应用程序由一组协作或完全独立的 BPF 程序以及 BPF map 和全局变量组成，map 及全局变量可在所有 BPF 程序之间共享（允许它们在一组公共数据上进行协作）。BPF map 和全局变量也可以从用户空间访问（我们可以将应用程序的用户空间部分称为 ”控制程序” ），其允许控制程序获取或设置任何必要的额外数据。BPF 程序通常会经历以下阶段：
 
@@ -162,13 +164,86 @@ BPF程序逻辑非常简单。为样本获取一个临时存储，并用跟踪�
 - `<name>_bpf__attach()` – 附加所有可自动附加的 BPF 程序（它是可选的，你可以通过直接使用 libbpf API 获得更多控制）；
 - `<name>_bpf__destroy()` – 分离所有BPF 程序并释放所有使用的资源；
 
+### .skel.h的生成过程
 
+们有足够的上下文来查看[Makefile](https://github.com/da1234cao/bpf_exercise/blob/master/src/Makefile) 做了什么将所有内容编译成最终可执行文件。我将跳过一些必要的样板部分，而只关注基本要素。
+
+```makefile
+INCLUDES := -I$(OUTPUT)
+CFLAGS := -g -Wall
+ARCH := $(shell uname -m | sed 's/x86_64/x86/')
+```
+
+这里我们定义了一些编译过程中使用的额外参数。默认情况下，所有中间文件都会写在`src/.output/`子目录下，所以这个目录被添加到C编译器的包含路径中，以查找BPF骨架和libbpf头文件。所有用户空间文件都使用调试信息 ( `-g`)进行编译，并且没有进行任何优化以使其更易于调试。`ARCH`捕获主机操作系统架构，稍后将其传递到 BPF 代码编译步骤，以便与低级跟踪助手宏一起使用。
+
+```makefile
+APPS = perfbuf-output
+```
+
+这是可用应用程序的列表。只需在此处添加应用程序的名称即可构建。每个应用程序都定义了相应的 make 目标，因此您可以使用以下命令构建相关文件：
+
+```makefile
+make perfbuf-output
+```
+
+整个构建过程分几个步骤进行。首先，libbpf 构建为静态库，其 API 头文件安装到`.output/`(如果您想针对系统范围的`libbpf`共享库进行构建，则可以删除此步骤并相应地调整编译规则。)：
+
+```makefile
+# Build libbpf
+$(LIBBPF_OBJ):$(wildcard $(LIBBPF_SRC)/*.[ch]) $(LIBBPF_SRC)/Makefile | $(OUTPUT)/libbpf
+	$(Q)$(MAKE) -C $(LIBBPF_SRC) BUILD_STATIC_ONLY=1 \
+	OBJDIR=$(dir $@)/libbpf DESTDIR=$(dir $@) \
+	INCLUDEDIR= LIBDIR= UAPIDIR= \
+	install
+```
+
+下一步将 BPF C 代码 ( `*.bpf.c`)编译成.o文件：
+
+```makefile
+# Build BPF code
+$(OUTPUT)/%.bpf.o : %.bpf.c $(LIBBPF_OBJ) common.h
+	$(Q)$(CLANG) -g -O2 -target bpf -D__TARGET_ARCH_$(ARCH) $(INCLUDES) -I. -c $(filter %.c,$^) -o $@
+	$(Q)$(LLVM_STRIP) -g $@
+```
+
+我们使用 Clang 来做到这一点。`-g`必须让 Clang 发出 BTF 信息。 `-O2`也是 BPF 编译所必需的。`-D__TARGET_ARCH_$(ARCH)`为`bpf_tracing.h`处理低级宏的头定义必要的`struct pt_regs`宏。如果您不处理 kprobes 和 `struct pt_regs`. 最后，我们从生成的`.o` 文件中去除 DWARF 信息，因为它从未使用过，而且大多只是 Clang 的编译工件。
+
+BTF 是 BPF 功能所需的唯一信息，并且在剥离期间保留。减小`.bpf.o` 文件的大小很重要，因为它将通过 BPF skeleton嵌入到最终的应用程序二进制文件中，因此不需要用不需要的 DWARF 数据增加其大小。
+
+现在我们已经`.bpf.o`生成了文件，`bpftool`用于生成相应的 BPF skeleton ( `.skel.h`) 和`bpftool gen skeleton` 命令：
+
+```makefile
+# Generate BPF skeletons
+$(OUTPUT)/%.skel.h : $(OUTPUT)/%.bpf.o | $(OUTPUT)
+	$(Q)$(BPFTOOL) gen skeleton $< > $@
+```
+
+有了这个，我们确保每当 BPF skeleton更新时，应用程序的用户空间部分也会重建，因为它们需要在编译期间嵌入 BPF skeleton。否则，用户空间`.c`→的编译`.o`非常简单：
+
+```makefile
+# Build user-space code
+$(OUTPUT)/%.o : %.c $(wildcard %.h) | $(OUTPUT)
+	$(Q)$(CC) $(CFLAGS) $(INCLUDES) -c $(filter %.c, $^) -o $@
+
+# 用户态的代码，依赖于skeletons
+$(patsubst %,$(OUTPUT)/%.o,$(APPS)) : %.o : %.skel.h
+```
+
+最后，仅使用用户空间`.o`文件（与`libbpf.a`静态库一起）生成最终的二进制文件。`-lelf`并且`-lz`是 libbpf 的依赖项，需要明确提供给编译器：
+
+```makefile
+# Build final application
+$(APPS): %: $(OUTPUT)/%.o $(LIBBPF_OBJ) | $(OUTPUT)
+	$(Q)$(CC) $(CFLAGS) $^ -lelf -lz -o $@
+```
+
+就是这样，在运行完这几个步骤之后，您将最终得到一个小的用户空间二进制文件，该二进制文件通过 BPF skeleton嵌入已编译的 BPF 代码，并在其中静态链接 libbpf，因此不依赖于系统范围的`libbpf` 可用性。结果是一个小、快速、独立的二进制文件。
 
 ---
 
 ## 用户空间读取perf buffer
 
-完成最小的初始设置后，例如：设置 libbpf 日志处理程序，中断处理程序，提高 BPF 系统的 RLIMIT_MEMLOCK 限制，它只会打开并加载BPF框架。
+完成最小的初始设置后，例如：设置 libbpf 日志处理程序，中断处理程序，提高 BPF 系统的 RLIMIT_MEMLOCK 限制，它只会打开并加载BPFskeleton。
 
 ```c
 int libbpf_print_fn(enum libbpf_print_level level,const char *format, va_list args){
